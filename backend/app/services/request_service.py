@@ -5,12 +5,8 @@ Submissions land in the queue here; the background worker consumes them.
 
 from __future__ import annotations
 
-from typing import Any
-
 from app.db import connect
-from app.repositories import orchestrations as orch_repo
 from app.repositories import requests as req_repo
-from app.services.orchestrate_service import execute_orchestration
 
 MAX_KEY_LENGTH = 128
 MAX_NOTE_LENGTH = 500
@@ -31,30 +27,22 @@ def _validate_key(idempotency_key: str) -> str:
     return key
 
 
-def _start_extra_orchestration(conn, request: dict[str, Any]) -> None:
-    """Continue queue processing for an existing idempotency key."""
-    orch_id = orch_repo.create_orchestration(conn)
-    req_repo.attach_orchestration(
-        conn, request_id=request["id"], orchestration_id=orch_id
-    )
-    execute_orchestration(conn, orch_id)
-    req_repo.mark_succeeded(conn, request_id=request["id"])
-    conn.commit()
-
-
 def enqueue_request(idempotency_key: str, note: str | None) -> tuple[dict[str, Any], bool]:
-    """Enqueue one orchestration request, deduplicating on the idempotency key."""
+    """Enqueue one orchestration request, deduplicating on the idempotency key.
+
+    A repeated key only returns the existing request (with ``dedupe_count``
+    incremented inside the repository transaction). It never starts an
+    orchestration and never alters the existing request's status, linked
+    orchestration, error or timestamps -- so a request that already
+    succeeded or failed is left in its terminal state.
+    """
     key = _validate_key(idempotency_key)
     clean_note = note.strip() if isinstance(note, str) and note.strip() else None
     if clean_note and len(clean_note) > MAX_NOTE_LENGTH:
         clean_note = clean_note[:MAX_NOTE_LENGTH]
     conn = connect()
     try:
-        request, created = req_repo.enqueue(conn, idempotency_key=key, note=clean_note)
-        if not created and request is not None:
-            _start_extra_orchestration(conn, request)
-            request = req_repo.get_request_by_key(conn, key) or request
-        return request, created
+        return req_repo.enqueue(conn, idempotency_key=key, note=clean_note)
     finally:
         conn.close()
 
@@ -84,11 +72,15 @@ def get_request_report(request_id: int) -> dict[str, Any] | None:
 
 
 def request_stats() -> dict[str, int]:
-    """Queue accounting: enqueue/dedupe/success/failure counters."""
+    """Queue accounting: enqueue/dedupe/success/failure counters.
+
+    ``linked_orchestrations`` is the actual number of request rows linked to
+    an orchestration record; with one run per consumed request it equals
+    succeeded + failed, and ``shadow_runs`` (orchestrations no request points
+    at) stays zero -- the request list, counters and runs reconcile 1:1.
+    """
     conn = connect()
     try:
-        stats = req_repo.stats(conn)
-        stats["linked_orchestrations"] = stats.get("succeeded", 0) + stats.get("failed", 0)
-        return stats
+        return req_repo.stats(conn)
     finally:
         conn.close()

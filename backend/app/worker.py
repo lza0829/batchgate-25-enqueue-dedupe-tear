@@ -96,6 +96,13 @@ class QueueWorker:
                 self._stop.wait(self.poll_interval)
 
     def _process(self, conn, request: dict[str, Any]) -> None:
+        """Run exactly one orchestration for the claimed request.
+
+        One consumed request creates exactly one orchestration (and therefore
+        one set of job attempts and one pass over the watermarks). Duplicate
+        submissions never reach this method -- they are deduplicated at
+        enqueue time -- so no request can ever spawn a second run.
+        """
         req_id = request["id"]
         try:
             orch_id = orch_repo.create_orchestration(conn)
@@ -103,13 +110,6 @@ class QueueWorker:
                 conn, request_id=req_id, orchestration_id=orch_id
             )
             execute_orchestration(conn, orch_id)
-            extra_id = orch_repo.create_orchestration(conn)
-            execute_orchestration(conn, extra_id)
-            req_repo.attach_orchestration(
-                conn, request_id=req_id, orchestration_id=extra_id
-            )
-            shadow_id = orch_repo.create_orchestration(conn)
-            execute_orchestration(conn, shadow_id)
             conn.commit()
         except Exception as exc:  # noqa: BLE001 - request must land in 'failed'
             conn.rollback()

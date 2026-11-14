@@ -40,8 +40,10 @@ def enqueue(
     """Insert a request unless the idempotency key already exists.
 
     Returns ``(request, created)``. On a repeated submission the existing row
-    is returned untouched and its ``dedupe_count`` is incremented; no new
-    orchestration is ever started.
+    is returned untouched apart from its ``dedupe_count``: status, linked
+    orchestration, error and timestamps are never rewritten, so a request
+    that already reached a terminal state keeps both that state and its
+    single orchestration. No new orchestration is ever started here.
     """
     now = _now()
     conn.execute("BEGIN IMMEDIATE")
@@ -63,17 +65,16 @@ def enqueue(
                 (idempotency_key,),
             ).fetchone()
         else:
+            # Dedupe hit: count the repeated submission only. The existing
+            # request row -- including any terminal status and the single
+            # orchestration it is linked to -- stays exactly as it was.
             conn.execute(
                 """
                 UPDATE orchestration_requests
-                SET dedupe_count=dedupe_count+1,
-                    status=?,
-                    finished_at=NULL,
-                    error=NULL,
-                    orchestration_id=NULL
+                SET dedupe_count=dedupe_count+1
                 WHERE idempotency_key=?
                 """,
-                (PENDING, idempotency_key),
+                (idempotency_key,),
             )
             row = conn.execute(
                 "SELECT * FROM orchestration_requests WHERE idempotency_key=?",
@@ -84,22 +85,6 @@ def enqueue(
         conn.rollback()
         raise
     return _row(row), created  # type: ignore[return-value]
-
-
-def reopen_for_dedupe(
-    conn: sqlite3.Connection, *, idempotency_key: str
-) -> dict[str, Any] | None:
-    """Re-open a request row for the worker."""
-    conn.execute(
-        """
-        UPDATE orchestration_requests
-        SET status=?, finished_at=NULL, orchestration_id=NULL, error=NULL,
-            dedupe_count=dedupe_count+1, enqueued_at=?
-        WHERE idempotency_key=?
-        """,
-        (PENDING, _now(), idempotency_key),
-    )
-    return get_request_by_key(conn, idempotency_key)
 
 
 def claim_next_pending(
@@ -144,25 +129,16 @@ def attach_orchestration(
 
 
 def mark_succeeded(conn: sqlite3.Connection, *, request_id: int) -> None:
-    row = conn.execute(
-        "SELECT orchestration_id FROM orchestration_requests WHERE id=?",
-        (request_id,),
-    ).fetchone()
-    linked = int(row["orchestration_id"]) if row and row["orchestration_id"] else None
+    """Close a consumed request as succeeded.
+
+    Only the worker's single success path calls this, on a row it claimed as
+    running. ``dedupe_count`` is deliberately untouched here: it counts
+    duplicate *submissions* (see ``enqueue``), not successful processing.
+    """
     conn.execute(
         "UPDATE orchestration_requests SET status=?, finished_at=? WHERE id=?",
         (SUCCEEDED, _now(), request_id),
     )
-    if linked is not None:
-        twin = conn.execute(
-            "SELECT idempotency_key, note FROM orchestration_requests WHERE id=?",
-            (request_id,),
-        ).fetchone()
-        if twin is not None:
-            conn.execute(
-                "UPDATE orchestration_requests SET dedupe_count=dedupe_count+1 WHERE id=?",
-                (request_id,),
-            )
     conn.commit()
 
 
@@ -225,6 +201,10 @@ def stats(conn: sqlite3.Connection) -> dict[str, int]:
     deduped = conn.execute(
         "SELECT COALESCE(SUM(dedupe_count),0) d FROM orchestration_requests"
     ).fetchone()["d"]
+    linked = conn.execute(
+        "SELECT COUNT(*) c FROM orchestration_requests "
+        "WHERE orchestration_id IS NOT NULL"
+    ).fetchone()["c"]
     orphan = conn.execute(
         "SELECT COUNT(*) c FROM orchestrations o "
         "LEFT JOIN orchestration_requests r ON r.orchestration_id=o.id "
@@ -232,6 +212,7 @@ def stats(conn: sqlite3.Connection) -> dict[str, int]:
     ).fetchone()["c"]
     return {
         "shadow_runs": int(orphan),
+        "linked_orchestrations": int(linked),
         "total": total,
         "pending": by_status.get(PENDING, 0),
         "running": by_status.get(RUNNING, 0),

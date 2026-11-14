@@ -174,6 +174,224 @@ def test_deduped_request_never_starts_a_second_orchestration(isolated_db):
     assert request["dedupe_count"] == 1
 
 
+def test_duplicate_after_success_keeps_terminal_state_and_single_run(isolated_db):
+    """Re-submitting a key whose request already succeeded must not rewrite
+    the terminal state nor open a second orchestration/attempt/watermark set."""
+    from app.db import connect
+    from app.services import request_service
+
+    w = _new_worker()
+    first, _ = request_service.enqueue_request("terminal-ok", "original")
+    assert w.run_once() is True
+
+    conn = connect()
+    try:
+        before = dict(
+            conn.execute(
+                "SELECT * FROM orchestration_requests WHERE id=?", (first["id"],)
+            ).fetchone()
+        )
+        orch_before = conn.execute("SELECT COUNT(*) c FROM orchestrations").fetchone()["c"]
+        attempts_before = conn.execute("SELECT COUNT(*) c FROM job_attempts").fetchone()["c"]
+        watermarks_before = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT job_id, watermark_ts, artifact_rows FROM watermarks ORDER BY job_id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert before["status"] == "succeeded"
+    assert before["orchestration_id"] is not None
+
+    # Same key submitted again after the terminal state was reached.
+    duplicate, created = request_service.enqueue_request("terminal-ok", "later retry")
+    assert created is False
+
+    conn = connect()
+    try:
+        after = dict(
+            conn.execute(
+                "SELECT * FROM orchestration_requests WHERE id=?", (first["id"],)
+            ).fetchone()
+        )
+        orch_after = conn.execute("SELECT COUNT(*) c FROM orchestrations").fetchone()["c"]
+        attempts_after = conn.execute("SELECT COUNT(*) c FROM job_attempts").fetchone()["c"]
+        watermarks_after = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT job_id, watermark_ts, artifact_rows FROM watermarks ORDER BY job_id"
+            ).fetchall()
+        ]
+        orphan = conn.execute(
+            "SELECT COUNT(*) c FROM orchestrations o "
+            "LEFT JOIN orchestration_requests r ON r.orchestration_id=o.id "
+            "WHERE r.id IS NULL"
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+
+    # The duplicate only bumps the dedupe counter.
+    assert after["dedupe_count"] == before["dedupe_count"] + 1
+    # Terminal state and the single linked run are untouched.
+    for field in ("status", "orchestration_id", "error", "worker_name",
+                  "started_at", "finished_at", "enqueued_at", "created_at", "note"):
+        assert after[field] == before[field], field
+    assert after["status"] == "succeeded"
+    assert orch_after == orch_before == 1
+    assert attempts_after == attempts_before
+    assert watermarks_after == watermarks_before
+    assert orphan == 0
+
+    # The worker still has nothing new to consume.
+    assert w.run_once() is False
+
+
+def test_duplicate_after_failure_keeps_failed_terminal_state(isolated_db, monkeypatch):
+    """A failed request keeps its failed run when the same key is re-submitted."""
+    from app.db import connect
+    from app.services import request_service
+
+    def boom(_conn, _orch_id):
+        raise RuntimeError("fixture exploded")
+
+    monkeypatch.setattr(worker_module, "execute_orchestration", boom)
+
+    w = _new_worker()
+    first, _ = request_service.enqueue_request("terminal-fail", None)
+    assert w.run_once() is True
+
+    conn = connect()
+    try:
+        before = dict(
+            conn.execute(
+                "SELECT * FROM orchestration_requests WHERE id=?", (first["id"],)
+            ).fetchone()
+        )
+        orch_before = conn.execute("SELECT COUNT(*) c FROM orchestrations").fetchone()["c"]
+    finally:
+        conn.close()
+    assert before["status"] == "failed"
+    assert before["orchestration_id"] is not None
+
+    duplicate, created = request_service.enqueue_request("terminal-fail", "retry anyway")
+    assert created is False
+    assert duplicate["status"] == "failed"
+    assert duplicate["orchestration_id"] == before["orchestration_id"]
+    assert duplicate["error"] == before["error"]
+    assert duplicate["finished_at"] == before["finished_at"]
+    assert duplicate["dedupe_count"] == before["dedupe_count"] + 1
+
+    conn = connect()
+    try:
+        orch_after = conn.execute("SELECT COUNT(*) c FROM orchestrations").fetchone()["c"]
+        linked = conn.execute(
+            "SELECT orchestration_id FROM orchestration_requests WHERE id=?",
+            (first["id"],),
+        ).fetchone()["orchestration_id"]
+        orch_status = conn.execute(
+            "SELECT status FROM orchestrations WHERE id=?", (linked,)
+        ).fetchone()["status"]
+    finally:
+        conn.close()
+    assert orch_after == orch_before == 1
+    assert orch_status == "failed"
+    assert w.run_once() is False  # not requeued
+
+
+def test_one_request_produces_one_run_one_attempt_set_and_one_watermark_pass(isolated_db):
+    """Even with many duplicate submissions, only one run/attempt set exists
+    and watermarks are written exactly once (their updated_at is stable)."""
+    from app.db import connect
+    from app.services import request_service
+
+    w = _new_worker()
+    request_service.enqueue_request("wm-key", None)
+    for _ in range(4):
+        dup, created = request_service.enqueue_request("wm-key", None)
+        assert created is False
+    assert dup["dedupe_count"] == 4
+
+    assert w.run_once() is True
+    assert w.run_once() is False
+
+    conn = connect()
+    try:
+        request = conn.execute(
+            "SELECT * FROM orchestration_requests WHERE idempotency_key=?",
+            ("wm-key",),
+        ).fetchone()
+        orch_count = conn.execute("SELECT COUNT(*) c FROM orchestrations").fetchone()["c"]
+        attempt_count = conn.execute(
+            "SELECT COUNT(*) c FROM job_attempts"
+        ).fetchone()["c"]
+        per_orch = conn.execute(
+            "SELECT orchestration_id, COUNT(*) c FROM job_attempts GROUP BY orchestration_id"
+        ).fetchall()
+        wm_updated = [
+            r["updated_at"]
+            for r in conn.execute(
+                "SELECT updated_at FROM watermarks WHERE watermark_ts IS NOT NULL"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert request["status"] == "succeeded"
+    assert request["dedupe_count"] == 4  # no phantom increment from success path
+    assert orch_count == 1
+    # All attempts belong to the single linked orchestration.
+    assert len(per_orch) == 1
+    assert per_orch[0]["orchestration_id"] == request["orchestration_id"]
+    assert attempt_count == per_orch[0]["c"]
+    assert len(wm_updated) >= 1 and wm_updated.count(wm_updated[0]) == len(wm_updated)
+
+
+def test_stats_linked_runs_reconcile_with_request_list(isolated_db):
+    """dedupe count, request rows and linked orchestrations match 1:1."""
+    from app.db import connect
+    from app.services import request_service
+
+    w = _new_worker()
+    request_service.enqueue_request("a", None)
+    request_service.enqueue_request("b", None)
+    request_service.enqueue_request("a", None)  # dedupe
+    request_service.enqueue_request("a", None)  # dedupe
+
+    assert w.run_once() is True
+    assert w.run_once() is True
+    assert w.run_once() is False
+
+    stats = request_service.request_stats()
+    requests = request_service.list_requests()
+    assert stats["total"] == len(requests) == 2
+    assert stats["deduped_submissions"] == 2
+    assert stats["succeeded"] == 2
+    assert stats["linked_orchestrations"] == 2
+    assert stats["shadow_runs"] == 0
+
+    conn = connect()
+    try:
+        linked_rows = conn.execute(
+            "SELECT COUNT(*) c FROM orchestration_requests "
+            "WHERE orchestration_id IS NOT NULL"
+        ).fetchone()["c"]
+        orch_rows = conn.execute("SELECT COUNT(*) c FROM orchestrations").fetchone()["c"]
+        distinct_linked = conn.execute(
+            "SELECT COUNT(DISTINCT orchestration_id) c FROM orchestration_requests "
+            "WHERE orchestration_id IS NOT NULL"
+        ).fetchone()["c"]
+        sum_dedupe = conn.execute(
+            "SELECT COALESCE(SUM(dedupe_count),0) d FROM orchestration_requests"
+        ).fetchone()["d"]
+    finally:
+        conn.close()
+
+    assert linked_rows == distinct_linked == orch_rows == stats["linked_orchestrations"] == 2
+    assert sum_dedupe == stats["deduped_submissions"] == 2
+
+
 def test_worker_failure_marks_request_failed_with_failed_orchestration(isolated_db, monkeypatch):
     from app.services import request_service
 
